@@ -52,6 +52,8 @@ const pendingOffers = new Map();
 const callSessions = new Map();
 // endedCalls : callId -> timestamp (TTL 60s pour empêcher le replay d'anciens appels)
 const endedCalls = new Map();
+// Seul agent IVR autorisé à recevoir une demande de conseiller (touche 1).
+const IVR_AGENT_ID = "SERVICE-001";
 
 function logCall(event, details = {}) {
     console.log(`[CALL] ${event} | callId=${details.callId || "n/a"} | from=${details.from || "n/a"} | to=${details.to || "n/a"} | state=${details.state || "n/a"} | info=${details.info || ""}`);
@@ -525,6 +527,7 @@ wss.on("connection", (ws) => {
         if (type === "CALL_ACCEPTED") return traiterCallAccepted(message);
         if (type === "CALL_REJECTED") return traiterCallRejected(message);
         if (type === "CALL_ENDED") return traiterCallEnded(message);
+        if (type === "IVR_TRANSFER") return traiterTransfertIvr(message);
         if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER" || type === "renegotiate-offer" || type === "renegotiate-answer") {
             return relayerSignalisation(message);
         }
@@ -886,6 +889,104 @@ wss.on("connection", (ws) => {
         });
         supprimerAppel(from, to);
         logCall("ENDED", { callId, from, to, state: "ENDED" });
+    }
+
+    // ==================================================
+    // TRANSFERT IVR (TOUCHE 1)
+    // ==================================================
+    function traiterTransfertIvr(message) {
+        const from = identifiant;
+        const to = String(message.to || "").trim();
+        const callId = String(message.callId || "");
+        const digit = String(message.digit || "");
+
+        if (!to || !callId || digit !== "1") {
+            logCall("IVR_TRANSFER_IGNORED", { callId, from, to, info: "Champs invalides ou touche non autorisee" });
+            envoyer(ws, {
+                type: "ERROR",
+                message: "Demande de transfert invalide : champs manquants ou touche non autorisee."
+            });
+            return;
+        }
+
+        if (to !== IVR_AGENT_ID) {
+            logCall("IVR_TRANSFER_REFUSED", { callId, from, to, info: "Destination differente de l'agent IVR attendu" });
+            envoyer(ws, {
+                type: "ERROR",
+                message: `Transfert refuse : la destination doit etre l'agent IVR ${IVR_AGENT_ID}.`
+            });
+            return;
+        }
+
+        const session = callSessions.get(callId);
+        if (
+            !session ||
+            session.callId !== callId ||
+            session.from !== from ||
+            session.to !== to ||
+            session.state !== "CONNECTED"
+        ) {
+            logCall("IVR_TRANSFER_REFUSED", {
+                callId,
+                from,
+                to,
+                state: session ? session.state : "ABSENTE",
+                info: "Session IVR non valide pour cet emetteur"
+            });
+            envoyer(ws, {
+                type: "ERROR",
+                message: "Transfert refuse : aucun appel connecte ne correspond a cette demande."
+            });
+            return;
+        }
+
+        if (session.ivrTransferRequested) {
+            logCall("IVR_TRANSFER_IGNORED", { callId, from, to, state: "CONNECTED", info: "Demande deja transmise pour cet appel" });
+            envoyer(ws, {
+                type: "ERROR",
+                message: "Une demande de conseiller a deja ete transmise pour cet appel."
+            });
+            return;
+        }
+
+        const wsIvr = utilisateurs.get(to);
+        if (!wsIvr || wsIvr.readyState !== WebSocket.OPEN) {
+            logCall("IVR_TRANSFER_FAILED", { callId, from, to, info: "Agent IVR non connecte en WebSocket" });
+            envoyer(ws, {
+                type: "ERROR",
+                message: "Transfert impossible : l'agent IVR n'est pas connecte."
+            });
+            return;
+        }
+
+        if (appels.get(from) !== to) {
+            logCall("IVR_TRANSFER_REFUSED", { callId, from, to, info: "Aucun appel actif entre l'emetteur et l'agent IVR" });
+            envoyer(ws, {
+                type: "ERROR",
+                message: "Transfert refuse : l'appel avec l'agent IVR n'est plus actif."
+            });
+            return;
+        }
+
+        const transmis = envoyerAUtilisateur(to, {
+            type: "ivr-transfer",
+            from: from,
+            to: to,
+            callId: callId,
+            digit: digit
+        });
+
+        if (!transmis) {
+            logCall("IVR_TRANSFER_FAILED", { callId, from, to, info: "Agent IVR non connecte en WebSocket" });
+            envoyer(ws, {
+                type: "ERROR",
+                message: "Transfert impossible : l'agent IVR n'est pas connecte."
+            });
+            return;
+        }
+
+        session.ivrTransferRequested = true;
+        logCall("IVR_TRANSFER", { callId, from, to, state: "CONNECTED", info: "Touche 1 relayee a l'agent IVR" });
     }
 
     // ==================================================
