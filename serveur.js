@@ -59,6 +59,10 @@ function logCall(event, details = {}) {
     console.log(`[CALL] ${event} | callId=${details.callId || "n/a"} | from=${details.from || "n/a"} | to=${details.to || "n/a"} | state=${details.state || "n/a"} | info=${details.info || ""}`);
 }
 
+function normaliserHasVideo(value) {
+    return value === true || value === "true";
+}
+
 function markCallEnded(callId) {
     if (!callId) return;
     endedCalls.set(String(callId), Date.now());
@@ -172,7 +176,7 @@ function gererErreurFCM(error, to) {
 // - Affiche les deux boutons [Refuser] et [Accepter]
 // - Ne force PAS l'ouverture de l'application (zéro concurrence avec l'interface)
 // =============================================================================
-function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
+function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal) {
     if (!messaging) {
         console.error("⚠️ Firebase Messaging n'est pas initialisé.");
         return;
@@ -195,6 +199,7 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
             icon: "ic_launcher",
             color: "#00A884",
             offer: offerStr || "",
+            hasVideo: String(normaliserHasVideo(hasVideo)),
             actions: JSON.stringify([
                 {
                     title: "Refuser",
@@ -239,7 +244,7 @@ function envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr,
 // - Payload Data-Only silencieux (AUCUNE notification système affichée dans la barre)
 // - Déclenche le réveil matériel de l'écran via backgroundMode.wakeUp() et l'Interface 2
 // =============================================================================
-function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal) {
+function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal) {
     if (!messaging) {
         console.error("⚠️ Firebase Messaging n'est pas initialisé.");
         return;
@@ -260,6 +265,7 @@ function envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, n
             appelant: String(from),
             app_name: "KamSoft",
             offer: offerStr || "",
+            hasVideo: String(normaliserHasVideo(hasVideo)),
             "force-start": "1",
             "content-available": "1"
         },
@@ -361,10 +367,10 @@ const server = http.createServer(async (req, res) => {
 
         try {
             if (isTestVeille) {
-                envoyerPushTest2Veille(token, targetId, "TEST-APPELANT", "CALL-TEST-VEILLE", "", notIdVal);
+                envoyerPushTest2Veille(token, targetId, "TEST-APPELANT", "CALL-TEST-VEILLE", "", false, notIdVal);
                 return res.end(JSON.stringify({ success: true, mode: "TEST 2 (Réveil Veille)", target: targetId }));
             } else {
-                envoyerPushTest1Banniere(token, targetId, "TEST-APPELANT", "CALL-TEST-BANNIERE", "", notIdVal);
+                envoyerPushTest1Banniere(token, targetId, "TEST-APPELANT", "CALL-TEST-BANNIERE", "", false, notIdVal);
                 return res.end(JSON.stringify({ success: true, mode: "TEST 1 (Bannière Interactive)", target: targetId }));
             }
         } catch (pushErr) {
@@ -608,6 +614,7 @@ wss.on("connection", (ws) => {
                         from: pending.from,
                         to: identifiant,
                         offer: pending.offer,
+                        hasVideo: normaliserHasVideo(pending.hasVideo),
                         callId: callId
                     });
                 } else {
@@ -626,6 +633,7 @@ wss.on("connection", (ws) => {
         const from = identifiant;
         const to = String(message.to || "").trim();
         const callId = String(message.callId || (Date.now().toString() + "-" + Math.random().toString(36).substring(2, 9)));
+        const hasVideo = normaliserHasVideo(message.hasVideo);
 
         if (to === "") {
             envoyer(ws, { type: "ERROR", message: "Destinataire manquant." });
@@ -671,12 +679,19 @@ wss.on("connection", (ws) => {
             to: to,
             state: "RINGING",
             offer: message.offer,
+            hasVideo: hasVideo,
             createdAt: Date.now()
         };
         callSessions.set(callId, session);
 
         if (message.offer) {
-            pendingOffers.set(to, { from: from, offer: message.offer, callId: callId, createdAt: Date.now() });
+            pendingOffers.set(to, {
+                from: from,
+                offer: message.offer,
+                hasVideo: hasVideo,
+                callId: callId,
+                createdAt: Date.now()
+            });
         }
 
         let transmisWs = false;
@@ -689,6 +704,7 @@ wss.on("connection", (ws) => {
                 from: from,
                 to: to,
                 offer: message.offer,
+                hasVideo: hasVideo,
                 callId: callId
             });
             if (transmisWs) {
@@ -717,10 +733,10 @@ wss.on("connection", (ws) => {
             const isStrictementEcranAllume = (screenState === "SCREEN_ON") && destinataireEnLigne;
             if (isStrictementEcranAllume) {
                 console.log(`☀️ [TEST 1] Destinataire ${to} écran allumé et en ligne -> Push bannière interactive`);
-                envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, notIdVal);
+                envoyerPushTest1Banniere(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal);
             } else {
                 console.log(`🌙 [TEST 2] Destinataire ${to} en veille ou hors ligne (${screenState || "défaut"}) -> Push réveil écran`);
-                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, notIdVal);
+                envoyerPushTest2Veille(tokenDestinataire, to, from, callId, offerStr, hasVideo, notIdVal);
             }
         } else if (isDestinataireAuPremierPlan) {
             console.log(`ℹ️ Destinataire ${to} a l'application ouverte au premier plan : push FCM non requis.`);
