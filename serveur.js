@@ -51,6 +51,8 @@ const pendingOffers = new Map();
 const MAX_PARTICIPANTS = 4;
 const MAX_JOIN_ATTEMPTS_PER_CONNECTION = 10;
 const ROOM_STATE_INTERVAL_MS = 100;
+const CHAT_RATE_LIMIT_COUNT = 5;
+const CHAT_RATE_LIMIT_WINDOW_MS = 5000;
 const ROOM_CODE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const rooms = new Map();
 const roomCodes = new Map();
@@ -643,7 +645,7 @@ wss.on("connection", (ws) => {
         if (
             (type === "CREATE_ROOM" || type === "JOIN_ROOM" || type === "LEAVE_ROOM" ||
                 type === "ROOM_OFFER" || type === "ROOM_ANSWER" || type === "ROOM_ICE" ||
-                type === "ROOM_STATE") &&
+                type === "ROOM_STATE" || type === "CHAT_MESSAGE") &&
             !wsClient.sessionAuthenticated
         ) {
             envoyerErreurSalle(wsClient, "AUTH_REQUIRED", "Un jeton de session est requis pour gérer les salles.", type);
@@ -659,6 +661,7 @@ wss.on("connection", (ws) => {
         if (type === "JOIN_ROOM") return rejoindreSalle(wsClient, identifiant, message);
         if (type === "LEAVE_ROOM") return quitterSalle(wsClient, identifiant, message);
         if (type === "ROOM_STATE") return mettreAJourEtatSalle(wsClient, identifiant, message);
+        if (type === "CHAT_MESSAGE") return traiterMessageChat(wsClient, identifiant, message);
         if (type === "ROOM_OFFER" || type === "ROOM_ANSWER" || type === "ROOM_ICE") {
             return relayerRoomSignalisation(wsClient, identifiant, message);
         }
@@ -789,6 +792,51 @@ wss.on("connection", (ws) => {
                 audio: participant.audio,
                 video: participant.video
             });
+        }
+    }
+
+    function traiterMessageChat(wsClient, participantId, message) {
+        const roomId = String(message.roomId || "");
+        const room = rooms.get(roomId);
+        const participant = room && room.participants.get(participantId);
+        if (!participant) {
+            envoyerErreurSalle(wsClient, "NOT_IN_ROOM", "Vous ne participez pas à cette salle.", "CHAT_MESSAGE");
+            return;
+        }
+
+        const text = (typeof message.text === "string" ? message.text : "")
+            .replace(/[\u0000-\u0009\u000B-\u001F\u007F-\u009F]/g, "")
+            .trim();
+        if (!text) {
+            envoyerErreurSalle(wsClient, "CHAT_EMPTY", "Le message ne peut pas être vide.", "CHAT_MESSAGE");
+            return;
+        }
+        if (text.length > 500) {
+            envoyerErreurSalle(wsClient, "CHAT_TOO_LONG", "Le message dépasse la limite de 500 caractères.", "CHAT_MESSAGE");
+            return;
+        }
+
+        const now = Date.now();
+        wsClient.chatMessageTimes = (wsClient.chatMessageTimes || []).filter(
+            (sentAt) => now - sentAt < CHAT_RATE_LIMIT_WINDOW_MS
+        );
+        if (wsClient.chatMessageTimes.length >= CHAT_RATE_LIMIT_COUNT) {
+            envoyerErreurSalle(wsClient, "CHAT_RATE_LIMITED", "Vous envoyez des messages trop rapidement. Réessayez dans quelques secondes.", "CHAT_MESSAGE");
+            return;
+        }
+        wsClient.chatMessageTimes.push(now);
+
+        const chatMessage = {
+            type: "CHAT",
+            roomId,
+            id: crypto.randomUUID(),
+            from: participantId,
+            displayName: participant.displayName,
+            text,
+            sentAt: now
+        };
+        for (const recipientId of room.participants.keys()) {
+            envoyerAUtilisateur(recipientId, chatMessage);
         }
     }
 
