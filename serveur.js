@@ -2,6 +2,7 @@ const http = require("http");
 const WebSocket = require("ws");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 // MODIFICATION RENDER : Utilisation du port dynamique
 const PORT = process.env.PORT || 8080;
@@ -46,6 +47,11 @@ const userAppStates = new Map(); // identifiant -> isForeground (boolean)
 const userScreenStates = new Map(); // identifiant -> "SCREEN_ON" | "SCREEN_OFF"
 const appels = new Map();
 const pendingOffers = new Map();
+const MAX_PARTICIPANTS = 4;
+const MAX_JOIN_ATTEMPTS_PER_CONNECTION = 10;
+const ROOM_CODE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const rooms = new Map();
+const roomCodes = new Map();
 
 // MACHINE À ÉTATS SERVEUR & DÉDUPLICATION
 // callSessions : callId -> { callId, from, to, state: "RINGING" | "ACCEPTING" | "CONNECTED" | "REJECTED" | "ENDED", offer, createdAt }
@@ -444,12 +450,86 @@ function supprimerAppel(utilisateurA, utilisateurB) {
     console.log(`📴 APPEL TERMINE : ${utilisateurA} <--> ${utilisateurB}`);
 }
 
+function genererCodeSalle() {
+    let code;
+    do {
+        code = Array.from({ length: 6 }, () =>
+            ROOM_CODE_CHARACTERS[crypto.randomInt(ROOM_CODE_CHARACTERS.length)]
+        ).join("");
+    } while (roomCodes.has(code));
+    return code;
+}
+
+function trouverSalleParticipant(participantId) {
+    for (const room of rooms.values()) {
+        if (room.participants.has(participantId)) return room;
+    }
+    return null;
+}
+
+function roomPayload(room) {
+    return {
+        roomId: room.id,
+        code: room.code,
+        hostId: room.hostId,
+        state: room.state,
+        participants: Array.from(room.participants.values())
+    };
+}
+
+function envoyerErreurSalle(ws, code, message, requestType) {
+    envoyer(ws, { type: "ROOM_ERROR", code, message, requestType });
+}
+
+function fermerSalle(room, reason) {
+    room.state = "closed";
+    rooms.delete(room.id);
+    roomCodes.delete(room.code);
+    for (const participantId of room.participants.keys()) {
+        envoyerAUtilisateur(participantId, {
+            type: "ROOM_CLOSED",
+            roomId: room.id,
+            code: room.code,
+            reason
+        });
+    }
+    room.participants.clear();
+}
+
+function retirerParticipantSalle(room, participantId, reason) {
+    if (!room || !room.participants.has(participantId)) return;
+    if (room.hostId === participantId) {
+        fermerSalle(room, reason || "host_left");
+        return;
+    }
+
+    room.participants.delete(participantId);
+    for (const remainingId of room.participants.keys()) {
+        envoyerAUtilisateur(remainingId, {
+            type: "PARTICIPANT_LEFT",
+            roomId: room.id,
+            participantId,
+            reason
+        });
+    }
+    if (room.participants.size === 0) fermerSalle(room, "empty");
+}
+
+function nettoyerSallesParticipant(participantId) {
+    for (const room of Array.from(rooms.values())) {
+        if (room.participants.has(participantId)) {
+            retirerParticipantSalle(room, participantId, "disconnected");
+        }
+    }
+}
+
 // ======================================================
 // CONNEXION CLIENT WEBSOCKET
 // ======================================================
 wss.on("connection", (ws) => {
     console.log("Nouveau client connecte.");
     let identifiant = null;
+    ws.joinRoomAttempts = 0;
 
     ws.isAlive = true;
     ws.on("pong", () => {
@@ -534,6 +614,9 @@ wss.on("connection", (ws) => {
         if (type === "CALL_REJECTED") return traiterCallRejected(message);
         if (type === "CALL_ENDED") return traiterCallEnded(message);
         if (type === "IVR_TRANSFER") return traiterTransfertIvr(message);
+        if (type === "CREATE_ROOM") return creerSalle(wsClient, identifiant, message);
+        if (type === "JOIN_ROOM") return rejoindreSalle(wsClient, identifiant, message);
+        if (type === "LEAVE_ROOM") return quitterSalle(wsClient, identifiant, message);
         if (type === "ICE_CANDIDATE" || type === "WEBRTC_OFFER" || type === "WEBRTC_ANSWER" || type === "renegotiate-offer" || type === "renegotiate-answer") {
             return relayerSignalisation(message);
         }
@@ -542,6 +625,88 @@ wss.on("connection", (ws) => {
             type: "ERROR",
             message: `Type de message inconnu : ${type}`
         });
+    }
+
+    function creerSalle(wsClient, participantId, message) {
+        if (trouverSalleParticipant(participantId)) {
+            envoyerErreurSalle(wsClient, "ALREADY_IN_ROOM", "Vous êtes déjà dans une salle.", "CREATE_ROOM");
+            return;
+        }
+
+        const room = {
+            id: crypto.randomUUID(),
+            code: genererCodeSalle(),
+            hostId: participantId,
+            state: "open",
+            participants: new Map(),
+            createdAt: Date.now()
+        };
+        room.participants.set(participantId, {
+            id: participantId,
+            displayName: String(message.displayName || participantId).slice(0, 80),
+            role: "host",
+            joinedAt: Date.now()
+        });
+        rooms.set(room.id, room);
+        roomCodes.set(room.code, room.id);
+        envoyer(wsClient, { type: "ROOM_CREATED", ...roomPayload(room) });
+    }
+
+    function rejoindreSalle(wsClient, participantId, message) {
+        ws.joinRoomAttempts += 1;
+        if (ws.joinRoomAttempts > MAX_JOIN_ATTEMPTS_PER_CONNECTION) {
+            envoyerErreurSalle(wsClient, "JOIN_RATE_LIMITED", "Trop de tentatives de rejoindre une salle.", "JOIN_ROOM");
+            ws.close(1008, "Too many JOIN_ROOM attempts");
+            return;
+        }
+
+        const code = typeof message.code === "string" ? message.code.trim().toUpperCase() : "";
+        if (!/^[ABCDEFGHJKLMNPQRSTUVWXYZ23456789]{6}$/.test(code)) {
+            envoyerErreurSalle(wsClient, "INVALID_CODE", "Code de salle invalide.", "JOIN_ROOM");
+            return;
+        }
+
+        const roomId = roomCodes.get(code);
+        const room = roomId && rooms.get(roomId);
+        if (!room || room.state !== "open") {
+            envoyerErreurSalle(wsClient, "ROOM_NOT_FOUND", "Salle introuvable.", "JOIN_ROOM");
+            return;
+        }
+        if (trouverSalleParticipant(participantId)) {
+            envoyerErreurSalle(wsClient, "ALREADY_IN_ROOM", "Vous êtes déjà dans une salle.", "JOIN_ROOM");
+            return;
+        }
+        if (room.participants.size >= MAX_PARTICIPANTS) {
+            envoyerErreurSalle(wsClient, "ROOM_FULL", "La salle est complète.", "JOIN_ROOM");
+            return;
+        }
+
+        const participant = {
+            id: participantId,
+            displayName: String(message.displayName || participantId).slice(0, 80),
+            role: "participant",
+            joinedAt: Date.now()
+        };
+        room.participants.set(participantId, participant);
+        envoyer(wsClient, { type: "ROOM_JOINED", ...roomPayload(room) });
+        for (const existingId of room.participants.keys()) {
+            if (existingId !== participantId) {
+                envoyerAUtilisateur(existingId, {
+                    type: "PARTICIPANT_JOINED",
+                    roomId: room.id,
+                    participant
+                });
+            }
+        }
+    }
+
+    function quitterSalle(wsClient, participantId, message) {
+        const room = rooms.get(String(message.roomId || ""));
+        if (!room || !room.participants.has(participantId)) {
+            envoyerErreurSalle(wsClient, "ROOM_NOT_FOUND", "Salle introuvable.", "LEAVE_ROOM");
+            return;
+        }
+        retirerParticipantSalle(room, participantId, "left");
     }
 
     // ==================================================
@@ -1047,6 +1212,8 @@ wss.on("connection", (ws) => {
             userAppStates.delete(id);
             userScreenStates.set(id, "SCREEN_OFF");
         }
+
+        nettoyerSallesParticipant(id);
 
         const correspondant = appels.get(id);
 
