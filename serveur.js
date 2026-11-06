@@ -693,8 +693,8 @@ wss.on("connection", (ws) => {
         room.participants.set(participantId, {
             id: participantId,
             displayName: nettoyerDisplayName(message.displayName),
-            audio: message.audio === true,
-            video: message.video === true,
+            audio: message.audio !== false,
+            video: message.video !== false,
             role: "host",
             joinedAt: Date.now()
         });
@@ -740,8 +740,8 @@ wss.on("connection", (ws) => {
         const participant = {
             id: participantId,
             displayName: nettoyerDisplayName(message.displayName),
-            audio: message.audio === true,
-            video: message.video === true,
+            audio: message.audio !== false,
+            video: message.video !== false,
             role: "participant",
             joinedAt: Date.now()
         };
