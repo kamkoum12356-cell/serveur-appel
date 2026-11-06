@@ -50,6 +50,7 @@ const appels = new Map();
 const pendingOffers = new Map();
 const MAX_PARTICIPANTS = 4;
 const MAX_JOIN_ATTEMPTS_PER_CONNECTION = 10;
+const ROOM_STATE_INTERVAL_MS = 100;
 const ROOM_CODE_CHARACTERS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const rooms = new Map();
 const roomCodes = new Map();
@@ -468,6 +469,15 @@ function trouverSalleParticipant(participantId) {
     return null;
 }
 
+function nettoyerDisplayName(value) {
+    const cleaned = (typeof value === "string" ? value : "")
+        .replace(/[\u0000-\u001F\u007F-\u009F]/g, "")
+        .trim()
+        .slice(0, 30)
+        .trim();
+    return cleaned || "Participant";
+}
+
 function roomPayload(room) {
     return {
         roomId: room.id,
@@ -632,7 +642,8 @@ wss.on("connection", (ws) => {
 
         if (
             (type === "CREATE_ROOM" || type === "JOIN_ROOM" || type === "LEAVE_ROOM" ||
-                type === "ROOM_OFFER" || type === "ROOM_ANSWER" || type === "ROOM_ICE") &&
+                type === "ROOM_OFFER" || type === "ROOM_ANSWER" || type === "ROOM_ICE" ||
+                type === "ROOM_STATE") &&
             !wsClient.sessionAuthenticated
         ) {
             envoyerErreurSalle(wsClient, "AUTH_REQUIRED", "Un jeton de session est requis pour gérer les salles.", type);
@@ -647,6 +658,7 @@ wss.on("connection", (ws) => {
         if (type === "CREATE_ROOM") return creerSalle(wsClient, identifiant, message);
         if (type === "JOIN_ROOM") return rejoindreSalle(wsClient, identifiant, message);
         if (type === "LEAVE_ROOM") return quitterSalle(wsClient, identifiant, message);
+        if (type === "ROOM_STATE") return mettreAJourEtatSalle(wsClient, identifiant, message);
         if (type === "ROOM_OFFER" || type === "ROOM_ANSWER" || type === "ROOM_ICE") {
             return relayerRoomSignalisation(wsClient, identifiant, message);
         }
@@ -680,7 +692,9 @@ wss.on("connection", (ws) => {
         };
         room.participants.set(participantId, {
             id: participantId,
-            displayName: String(message.displayName || participantId).slice(0, 80),
+            displayName: nettoyerDisplayName(message.displayName),
+            audio: message.audio === true,
+            video: message.video === true,
             role: "host",
             joinedAt: Date.now()
         });
@@ -725,7 +739,9 @@ wss.on("connection", (ws) => {
 
         const participant = {
             id: participantId,
-            displayName: String(message.displayName || participantId).slice(0, 80),
+            displayName: nettoyerDisplayName(message.displayName),
+            audio: message.audio === true,
+            video: message.video === true,
             role: "participant",
             joinedAt: Date.now()
         };
@@ -739,6 +755,40 @@ wss.on("connection", (ws) => {
                     participant
                 });
             }
+        }
+    }
+
+    function mettreAJourEtatSalle(wsClient, participantId, message) {
+        const roomId = String(message.roomId || "");
+        const room = rooms.get(roomId);
+        if (!room || !room.participants.has(participantId)) {
+            envoyerErreurSalle(wsClient, "NOT_IN_ROOM", "Vous ne participez pas à cette salle.", "ROOM_STATE");
+            return;
+        }
+        if (typeof message.audio !== "boolean" || typeof message.video !== "boolean") {
+            envoyerErreurSalle(wsClient, "INVALID_STATE", "L’état audio/vidéo doit être booléen.", "ROOM_STATE");
+            return;
+        }
+
+        const now = Date.now();
+        if (ws.lastRoomStateAt !== undefined && now - ws.lastRoomStateAt < ROOM_STATE_INTERVAL_MS) {
+            envoyerErreurSalle(wsClient, "STATE_RATE_LIMITED", "Trop de changements d’état. Réessayez dans un instant.", "ROOM_STATE");
+            return;
+        }
+        ws.lastRoomStateAt = now;
+
+        const participant = room.participants.get(participantId);
+        participant.audio = message.audio;
+        participant.video = message.video;
+        for (const otherId of room.participants.keys()) {
+            if (otherId === participantId) continue;
+            envoyerAUtilisateur(otherId, {
+                type: "PARTICIPANT_STATE",
+                roomId,
+                participantId,
+                audio: participant.audio,
+                video: participant.video
+            });
         }
     }
 
